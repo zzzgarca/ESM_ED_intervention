@@ -1,0 +1,1164 @@
+---
+title: "ESM_body"
+author: "Matu Silviu-Andrei"
+date: "2024-12-27"
+output: html_document
+---
+## Load packages
+```{r load_packages}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  plyr, #this has to be before dplyr
+  dplyr,
+  effectsize,
+  emmeans,
+  flextable,
+  ggplot2,
+  haven,
+  here,
+  kableExtra,
+  knitr,
+  kableExtra,
+  lme4,
+  matrixStats,
+  mice,
+  miceadds,
+  nlme,
+  RcmdrMisc,
+  rmarkdown,
+  readr,
+  rlang,
+  sjPlot,
+  sjmisc,
+  sjlabelled,
+  stringr,
+  tibble,
+  tidyr,
+  tidyverse
+)
+
+
+working_folder_path <- here()
+setwd(working_folder_path)
+data <- read.csv('Input_data.csv')
+options(max.print=9999)
+options(width = 500)
+
+version_number=20 #only used to keep track of the versions of the files
+
+
+```
+
+## Pre-processing
+### Replace group column values with 0 and 1
+Group 1 becomes group 0, and group 2 becomes group 1.
+```{r replace_with_0_1}
+
+replace_with_0_1  <- function(data, cols_to_replace){
+  for (column in cols_to_replace) {
+    data[[column]][data[[column]] == 1] <- 0
+    data[[column]][data[[column]] == 2] <- 1
+    }
+  return (data)
+}
+
+cols_to_replace <- c('group')
+data<-replace_with_0_1(data, cols_to_replace)
+```
+
+### Change time variables so that they start with 0
+```{r time_0}
+
+minus_1 <- function(data, cols_to_change){
+  for (column in cols_to_change){
+    data[[column]]<-data[[column]]-1
+  }
+  return(data)
+}
+
+cols_to_change<-c('day', 'beep')
+data<-minus_1(data, cols_to_change)
+```
+
+### One participant does not have exact time recordings for the beeps. They are raplaced with some default values
+```{r change_time_particiaptn_25}
+replacement_time=570
+
+for (beep_no in 0:4){
+  #first beep is replaced with 9:30 and all next ones receive times that are 2 hours after the previous one
+  data[data$id == 25 & data$beep == beep_no, "beeptime"] <- replacement_time
+  replacement_time=replacement_time+120
+}
+```
+
+### Compute a continous time variable reflecting the times passed since the start of the first day in the study
+```{r continous_time}
+compute_continous_time <- function(data, higher_framework_time_column, lower_framework_time_column, continuous_time_column, ratio_higher_lower_frameworktime) {
+  data[[continuous_time_column]] <- data[[higher_framework_time_column]] * ratio_higher_lower_frameworktime + data[[lower_framework_time_column]]
+  return(data)
+}
+
+higher_framework_time_column <- 'day'
+lower_framework_time_column <- 'beeptime'
+continuous_time_column <- 'beeptime_continous'
+ratio_higher_lower_frameworktime <- 1440 # 1440 transforms days into minutes
+
+data <- compute_continous_time(data, higher_framework_time_column, lower_framework_time_column, continuous_time_column, ratio_higher_lower_frameworktime)
+```
+
+### Compute a variable that can identify the beep in the sequence of all beeps across all days
+```{r create_day_beep}
+data$day_beep <- data$day*5+data$beep
+```
+
+### Rescale the continous time varaibles
+```{r rescale_time}
+
+rescale_minutes_to_hours <- function(data, cols_to_rescale){
+  for (column in cols_to_rescale) {
+    data[[column]]<-data[[column]]/60
+  }
+  return(data)
+}
+
+cols_to_rescale<-c('beeptime','beeptime_continous') #both will be now expressed in hours
+data<-rescale_minutes_to_hours(data, cols_to_rescale)
+```
+
+### Sort by id, day and beep
+```{r sorting}
+
+sort_multiple_columns <- function(data, cols_for_sorting){
+  data <- data %>%
+    arrange(across(all_of(cols_for_sorting)))
+  
+  return(data)
+}
+
+cols_for_sorting<-c('id', 'day', 'beep')
+data<-sort_multiple_columns(data, cols_for_sorting)
+```
+
+### Setting the names of key columns as separate variables to be called easily in functions
+```{r names}
+id_variable_name<-'id'
+day_variable_name<-'day'
+beep_number_variable_name<-'beep'
+beep_time_variable_name<-'beeptime'
+group_variable_name<-'group'
+
+#bellow is the continuous time variable computed above;
+continous_beep_variable_name<-'beeptime_continous'
+
+#bellow is the variable that indicates the beep number across all days
+unique_beep_number<-'day_beep' 
+```
+
+### Compute ciritical event variable
+```{r compute_critical_event_variable}
+data <- data %>%
+  mutate(critical_event = ifelse(NA_3>=3 | BS_1 >= 3 | SE_1 >= 3, 1, 0))
+
+#putting the name of the column inside a variable
+critical_event_variable_name<-'critical_event'
+```
+
+### Center group and critical event
+```{r center_variables}
+
+data <- data %>%
+  mutate(
+    group_centred = as.numeric(scale(.data[[group_variable_name]], scale = FALSE)),
+    critical_event_centred = as.numeric(scale(.data[[critical_event_variable_name]], scale = FALSE))
+    )
+
+#again, putting the names of the columns inside dedicated variables
+critical_event_centred_variable_name<-'critical_event_centred'
+group_centred_variable_name<-'group_centred'
+```
+
+### Computing lag for the critical event variable and its centred version
+```{r lag_critical_event}
+
+#making sure that the data is sorted
+data<-sort_multiple_columns(data, cols_for_sorting)
+
+compute_lag <- function(data, cols_to_process, id_variable_name, day_variable_name) {
+  for (variable in cols_to_process) {
+    lag_variable_name <- paste0('lag_', variable)
+    data <- data %>%                  
+      group_by(.data[[id_variable_name]], .data[[day_variable_name]]) %>%
+      mutate(!!lag_variable_name:= lag(.data[[variable]], n = 1, default = NA)) %>%
+      ungroup()
+  }
+  return(data)
+}
+
+cols_to_process<-c(critical_event_variable_name, critical_event_centred_variable_name)
+data<-compute_lag(data, cols_to_process, id_variable_name, day_variable_name)
+
+lagged_critical_event_variable_name<-'lag_critical_event'
+lagged_critical_event_centred_variable_name<-'lag_critical_event_centred'
+```
+
+## Descriptives
+### Dropping rows for beeps with no report
+```{r dropping_rows_for_beeps_with_no_data}
+
+#the data frame at this points includes empty rows for beeps that did not receive a response
+#we will remove those rows for the descriptive analysis
+#but we would like to keep the information on those rows namely the participant id and the time when the notification was sent
+complete_data<-data #keeping a copy of the original data to be used later
+
+data <- data %>% filter(!is.na(beepresp)) #dropping rows for beeps with no response
+
+#we use 'data' in function calls but the actual content might changes across sections of the analysis
+#we keep a copy of the data used for different purposes; here we keep a copy of the data used for the descriptive analysis
+data_for_descriptives <- data
+```
+
+### No. of participants
+```{r unique_parcicipants}
+unique_count_overall <- length(unique(data$id))
+print(paste0('Total N: ', unique_count_overall)) 
+
+
+# saving data for each group in dedicated dataframes
+filtered_group_0 <- data[data$group == 0, ]
+unique_ids_group_0 <- unique(filtered_group_0$id)
+print(paste0('Total N in group 0: ', length(unique_ids_group_0)))
+
+filtered_group_1 <- data[data$group == 1, ]
+unique_ids_group_1 <- unique(filtered_group_1$id)
+print(paste0('Total N in group 1: ', length(unique_ids_group_1)))
+
+
+number_reports <- nrow(data)
+print(paste0('Total number of reports: ', number_reports))
+
+number_reports_group_0 <- nrow(filtered_group_0)
+print(paste0('Total number of reports in group 0: ', number_reports_group_0))
+
+number_reports_group_1 <- nrow(filtered_group_1)
+print(paste0('Total number of reports in group 1: ', number_reports_group_1))
+
+print(unique_ids_group_0)
+print(unique_ids_group_1)
+
+study_number_of_beeps=35
+study_number_days=7
+study_beeps_day=5
+total_expected_reports=unique_count_overall*study_number_of_beeps
+print(paste0('Total number of expected reports: ', total_expected_reports))
+print(paste0('Percentage of actual reports from the expected total: ', number_reports/total_expected_reports))
+
+```
+
+### Count number of beeps per participant and per day/participant
+```{r count_beeps_days}
+count_beeps_participant <- data %>%
+  group_by(id) %>%
+  summarize(count = n(), .groups = 'drop')
+print(paste0('Average number of beeps per participant: ', mean(count_beeps_participant$count), ' Standard deviation:',
+             sd(count_beeps_participant$count)))
+
+print(paste0('Average percentage of responses from the total expected number of beeps (compliance in %): ',
+             mean((count_beeps_participant$count/study_number_of_beeps)*100)))
+
+count_beeps_participant_group_0 <- filtered_group_0 %>%
+  group_by(id) %>%
+  summarize(count = n(), .groups = 'drop')
+print(paste0('Average number of beeps per participant in group 0: ', mean(count_beeps_participant_group_0$count), ' Standard deviation:', sd(count_beeps_participant_group_0$count)))
+
+count_beeps_participant_group_1 <- filtered_group_1 %>%
+  group_by(id) %>%
+  summarize(count = n(), .groups = 'drop')
+print(paste0('Average number of beeps per participant in group 1: ', mean(count_beeps_participant_group_1$count), ' Standard deviation:', sd(count_beeps_participant_group_1$count)))
+
+#per day averages
+print(paste0('Average number of responses per day from the total expected number of beeps: ',
+             mean(count_beeps_participant$count/study_number_days)))
+print(paste0('Average number of responses per day from the total expected number of beeps in group 0: ',
+             mean(count_beeps_participant_group_0$count/study_number_days)))
+print(paste0('Average number of responses per day from the total expected number of beeps in group 1: ',
+             mean(count_beeps_participant_group_1$count/study_number_days)))
+
+no_participants_higher_17 <- count_beeps_participant %>%
+  filter(count >= 17 ) %>%
+  summarize(no_participants = n()) %>%
+  pull(no_participants)
+print(paste0('Number of participnts that respondend to 17 or more of the beeps: ', no_participants_higher_17))
+print(paste0('Percentage of participnts that respondend to 17 or more of the beeps: ', no_participants_higher_17/unique_count_overall))
+
+print('Number of beeps for each participant:')
+print(count_beeps_participant)
+write.csv(count_beeps_participant, file='Number_of_beeps_per_participant.csv', row.names=F)
+```
+
+### Count number of beeps per day/participant in the observed days (i.e., average number of beeps in days in which they reported at least a beep)
+#### This is less informative; we are more intereted overall, rather than the days in which they reported.
+```{r count_beeps_days_observed}
+count_beeps_participant_day_observed <- data %>%
+  group_by(id, day) %>%
+  summarize(count = n(), .groups = 'drop')
+print(paste0('Average number of beeps per participant per day in reporting days: ', mean(count_beeps_participant_day_observed$count), ' Standard deviation:', sd(count_beeps_participant_day_observed$count)))
+
+count_beeps_participant_day_observed_group_0 <- filtered_group_0 %>%
+  group_by(id, day) %>%
+  summarize(count = n(), .groups = 'drop')
+print(paste0('Average number of beeps per participant per day in reporting days in group 0: ', mean(count_beeps_participant_day_observed_group_0$count), ' Standard deviation:', sd(count_beeps_participant_day_observed_group_0$count)))
+
+count_beeps_participant_day_observed_group_1 <- filtered_group_1 %>%
+  group_by(id, day) %>%
+  summarize(count = n(), .groups = 'drop')
+print(paste0('Average number of beeps per participant per day in reporting days in group 1: ', mean(count_beeps_participant_day_observed_group_1$count), ' Standard deviation:', sd(count_beeps_participant_day_observed_group_1$count)))
+```
+
+### Compute means, SDs and other statistics
+```{r desciptives_table}
+
+descriptives_overall <- function(data, cols_to_compute) {
+  descriptives_datasets_list <- list()
+  for (variable in cols_to_compute) {
+    descriptive_stats_data <- data %>%
+      filter(!is.na(.data[[variable]])) %>%
+      summarize(
+        count = n(),
+        mean = round(mean(.data[[variable]], na.rm = TRUE), 2),
+        sd = round(sd(.data[[variable]], na.rm = TRUE), 2),
+        min = round(min(.data[[variable]], na.rm = TRUE), 2),
+        max = round(max(.data[[variable]], na.rm = TRUE), 2),
+        median = round(median(.data[[variable]], na.rm = TRUE), 2),
+        IQR = round(IQR(.data[[variable]], na.rm = TRUE), 2),
+        na_percentage = round(sum(is.na(.data[[variable]]))/n(), 4),
+        .groups = 'drop'
+      )
+    descriptive_stats_data <- descriptive_stats_data %>%
+      mutate(variable = variable)
+    descriptives_datasets_list[[variable]] <- descriptive_stats_data
+  }
+  descriptives_combined <- bind_rows(descriptives_datasets_list)
+  return(descriptives_combined)
+}
+
+descriptives_by_group <- function(data, cols_to_compute, group_column_name) {
+  descriptives_datasets_list <- list()
+  for (variable in cols_to_compute) {
+    descriptive_stats_data <- data %>%
+      filter(!is.na(.data[[variable]])) %>%
+      group_by(.data[[group_column_name]]) %>%
+      summarize(
+        count = n(),
+        mean = round(mean(.data[[variable]], na.rm = TRUE), 2),
+        sd = round(sd(.data[[variable]], na.rm = TRUE), 2),
+        min = round(min(.data[[variable]], na.rm = TRUE), 2),
+        max = round(max(.data[[variable]], na.rm = TRUE), 2),
+        median = round(median(.data[[variable]], na.rm = TRUE), 2),
+        IQR = round(IQR(.data[[variable]], na.rm = TRUE), 2),
+        na_percentage = round(sum(is.na(.data[[variable]]))/n(), 4),
+        .groups = 'drop'
+      )
+    descriptive_stats_data <- descriptive_stats_data %>%
+      mutate(variable = variable)
+    descriptives_datasets_list[[variable]] <- descriptive_stats_data
+  }
+  descriptives_combined <- bind_rows(descriptives_datasets_list)
+  return(descriptives_combined)
+}
+
+create_apa_table <- function(descriptive_stats) {
+  ft <- flextable(descriptive_stats)
+  ft <- set_header_labels(ft, 
+                          variable = "Variable",
+                          count = "N", 
+                          mean = "Mean", 
+                          sd = "SD", 
+                          min = "Min", 
+                          max = "Max", 
+                          median = "Median",
+                          IQR = "IQR",
+                          na_percentage = "% missing")
+  ft <- autofit(ft)
+  ft <- theme_vanilla(ft)
+  return(ft)
+}
+
+create_apa_table_by_group <- function(descriptive_stats) {
+  ft <- flextable(descriptive_stats)
+  ft <- set_header_labels(ft, 
+                          group = "Group", 
+                          variable = "Variable",
+                          count = "N", 
+                          mean = "Mean", 
+                          sd = "SD", 
+                          min = "Min", 
+                          max = "Max", 
+                          median = "Median",
+                          IQR = "IQR",
+                          na_percentage = "% missing")
+  ft <- autofit(ft)
+  ft <- theme_vanilla(ft)
+  return(ft)
+}
+
+#Variables used for descriptives
+cols_to_compute<-c('age',
+                   'beepresp',
+                   'beepdurat',
+                   'Body_check',
+                   'Restr',
+                   'Comp',
+                   'BE',
+                   'EE',
+                   'NA_1',
+                   'NA_2',
+                   'NA_3',
+                   'NA_4',
+                   'NA_5',
+                   'NA_6',
+                   'BS_1',
+                   'BS_2',
+                   'SE_1',
+                   'SE_2',
+                   'SS')
+
+group_column_name<-'group'
+
+descriptives_overall_results<-descriptives_overall(data, cols_to_compute)
+descriptives_apa_table_overall<- create_apa_table(descriptives_overall_results)
+descriptives_apa_table_overall
+
+descriptives_by_group_combined <- descriptives_by_group(data, cols_to_compute, group_column_name)
+descriptives_apa_table_by_group<- create_apa_table_by_group(descriptives_by_group_combined)
+print(descriptives_apa_table_by_group)
+```
+
+### Counting number of critical events
+```{r count_critical_events}
+number_of_total_critical_events <- data %>%
+  filter(critical_event == 1 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (any type; multiple types in the same report are counted only once): ', number_of_total_critical_events))
+
+number_of_total_critical_events_NA <- data %>%
+  filter(NA_3 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (general shame): ', number_of_total_critical_events_NA))
+
+number_of_total_critical_events_BS <- data %>%
+  filter(BS_1 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (body shame): ', number_of_total_critical_events_BS))
+
+number_of_total_critical_events_SE <- data %>%
+  filter(SE_1 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (shame about eating): ', number_of_total_critical_events_SE))
+
+
+number_of_total_critical_events_group_0 <- filtered_group_0 %>%
+  filter(critical_event == 1 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (any type; multiple types in the same report are counted only once) in group 0: ', number_of_total_critical_events_group_0))
+
+number_of_total_critical_events_NA_group_0 <- filtered_group_0 %>%
+  filter(NA_3 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (general shame) in group 0: ', number_of_total_critical_events_NA_group_0))
+
+number_of_total_critical_events_BS_group_0 <- filtered_group_0 %>%
+  filter(BS_1 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (body shame) in group 0: ', number_of_total_critical_events_BS_group_0))
+
+number_of_total_critical_events_SE_group_0 <- filtered_group_0 %>%
+  filter(SE_1 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (shame about eating) in group 0: ', number_of_total_critical_events_SE_group_0))
+
+
+number_of_total_critical_events_group_1 <- filtered_group_1 %>%
+  filter(critical_event == 1 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (any type; multiple types in the same report are counted only once) in group 1: ', number_of_total_critical_events_group_1))
+
+number_of_total_critical_events_NA_group_1 <- filtered_group_1 %>%
+  filter(NA_3 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (general shame) in group 1: ', number_of_total_critical_events_NA_group_1))
+
+number_of_total_critical_events_BS_group_1 <- filtered_group_1 %>%
+  filter(BS_1 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (body shame) in group 1: ', number_of_total_critical_events_BS_group_1))
+
+number_of_total_critical_events_SE_group_1 <- filtered_group_1 %>%
+  filter(SE_1 >= 3 ) %>%
+  summarize(count = n()) %>%
+  pull(count)
+print(paste0('Total number of reports with critical events (shame about eating) in group 1: ', number_of_total_critical_events_SE_group_1))
+
+
+#bellow we also have to count participants with 0s
+number_of_critical_events_per_participant <- data %>%
+  group_by(id) %>%
+  summarize(count = sum(critical_event == 1, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (any type; multiple types in the same report are counted only once): ',
+             mean(number_of_critical_events_per_participant$count), ', and SD: ', sd(number_of_critical_events_per_participant$count)))
+
+number_of_critical_events_per_participant_NA <- data %>%
+  group_by(id) %>%
+  summarize(count = sum(NA_3 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (NA): ',
+             mean(number_of_critical_events_per_participant_NA$count), ', and SD: ', sd(number_of_critical_events_per_participant_NA$count)))
+
+number_of_critical_events_per_participant_BS <- data %>%
+  group_by(id) %>%
+  summarize(count = sum(BS_1 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (BS): ',
+             mean(number_of_critical_events_per_participant_BS$count), ', and SD: ', sd(number_of_critical_events_per_participant_BS$count)))
+
+number_of_critical_events_per_participant_SE <- data %>%
+  group_by(id) %>%
+  summarize(count = sum(SE_1 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (SE): ',
+             mean(number_of_critical_events_per_participant_SE$count), ', and SD: ', sd(number_of_critical_events_per_participant_SE$count)))
+
+
+
+number_of_critical_events_per_participant_group_0 <- filtered_group_0 %>%
+  group_by(id) %>%
+  summarize(count = sum(critical_event == 1, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (any type; multiple types in the same report are counted only once) in group 0: ',
+             mean(number_of_critical_events_per_participant_group_0$count), ', and SD: ', sd(number_of_critical_events_per_participant_group_0$count)))
+
+number_of_critical_events_per_participant_NA_group_0 <- filtered_group_0 %>%
+  group_by(id) %>%
+  summarize(count = sum(NA_3 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (NA) for group 0: ',
+             mean(number_of_critical_events_per_participant_NA_group_0$count), ', and SD: ', sd(number_of_critical_events_per_participant_NA_group_0$count)))
+
+number_of_critical_events_per_participant_BS_group_0 <- filtered_group_0 %>%
+  group_by(id) %>%
+  summarize(count = sum(BS_1 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (BS) for group 0: ',
+             mean(number_of_critical_events_per_participant_BS_group_0$count), ', and SD: ', sd(number_of_critical_events_per_participant_BS_group_0$count)))
+
+number_of_critical_events_per_participant_SE_group_0 <- filtered_group_0 %>%
+  group_by(id) %>%
+  summarize(count = sum(SE_1 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (SE) for group 0: ',
+             mean(number_of_critical_events_per_participant_SE_group_0$count), ', and SD: ', sd(number_of_critical_events_per_participant_SE_group_0$count)))
+
+
+number_of_critical_events_per_participant_group_1 <- filtered_group_1 %>%
+  group_by(id) %>%
+  summarize(count = sum(critical_event == 1, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (any type; multiple types in the same report are counted only once) in group 1: ',
+             mean(number_of_critical_events_per_participant_group_1$count), ', and SD: ', sd(number_of_critical_events_per_participant_group_1$count)))
+
+number_of_critical_events_per_participant_NA_group_1 <- filtered_group_1 %>%
+  group_by(id) %>%
+  summarize(count = sum(NA_3 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (NA) for group 1: ',
+             mean(number_of_critical_events_per_participant_NA_group_1$count), ', and SD: ', sd(number_of_critical_events_per_participant_NA_group_1$count)))
+
+number_of_critical_events_per_participant_BS_group_1 <- filtered_group_1 %>%
+  group_by(id) %>%
+  summarize(count = sum(BS_1 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (BS) for group 1: ',
+             mean(number_of_critical_events_per_participant_BS_group_1$count), ', and SD: ', sd(number_of_critical_events_per_participant_BS_group_1$count)))
+
+number_of_critical_events_per_participant_SE_group_1 <- filtered_group_1 %>%
+  group_by(id) %>%
+  summarize(count = sum(SE_1 >= 3, na.rm = TRUE)) %>%
+  ungroup()
+print(paste0('Mean number of reports with critical events (SE) for group 1: ',
+             mean(number_of_critical_events_per_participant_SE_group_1$count), ' and SD: ', sd(number_of_critical_events_per_participant_SE_group_1$count)))
+
+print('Number of critical events per participant:')
+print(number_of_critical_events_per_participant)
+write.csv(number_of_critical_events_per_participant, file='Number_of_critical_events_per_participant.csv', row.names=F)
+
+print(paste0('Percentage of of reports with critial events across both groups: ', number_of_total_critical_events/number_reports))
+print(paste0('Percentage of of reports with critial events in group 0: ', number_of_total_critical_events_group_0/number_reports_group_0))
+print(paste0('Percentage of of reports with critial events in group 1: ', number_of_total_critical_events_group_1/number_reports_group_1))
+
+```
+
+## Analysis
+### Dependent variables to work with
+```{r variables_for_analysis}
+cols_to_analyze<-c('Body_check',
+                   'Restr',
+                   'Comp',
+                   'BE',
+                   'EE'
+                   )
+
+cols_for_plots<-c('Body Check',
+                 'Dietary Restraint',
+                 'Compensatory Behaviours',
+                 'Binge Eating',
+                 'Excesive Exercise'
+                 )
+```
+
+### Multilevel models
+```{r model_testing}
+lme_analysis <- function(dataset, cols_to_analyze, id_variable_name, day_variable_name, beep_time_variable_name, group_variable_name, critical_event_variable_name, control_params, variable_name_defining_correlation_structure, estimation, factors=FALSE) {
+  
+  df<-dataset
+  
+  if (factors) {
+    df[[group_variable_name]] <- as.factor(df[[group_variable_name]])
+    df[[critical_event_variable_name]] <- as.factor(df[[critical_event_variable_name]])
+  }
+
+  models_complete <- list()
+  models_simple <- list()
+
+  for (variable in cols_to_analyze) {
+    
+    formula_fixed_effects <- as.formula(paste0(variable, "~ ", day_variable_name, "+ ",  beep_time_variable_name, "+ ", group_variable_name, "+ ",
+                                          critical_event_variable_name, "+ ", critical_event_variable_name, "* ", group_variable_name))
+
+    model_complete <- lme(formula_fixed_effects,
+                          random = as.formula(paste0("~1+ ", day_variable_name, "+ ",  beep_time_variable_name, "+ ",
+                                                          critical_event_variable_name, "| ", id_variable_name)),                                    
+                          na.action = na.omit, #missing data is due to lags;
+                          #no prediction is made with NA on the lag variable so no prediction is made from one day to the next
+                          correlation = corCAR1(form = as.formula(paste0("~",  variable_name_defining_correlation_structure, "|",
+                                                                         id_variable_name, "/",day_variable_name))),
+                          data = df, method = estimation,
+                          control = control_params)
+
+    models_complete[[variable]] <- model_complete
+    
+    model_simple <- lme(formula_fixed_effects,
+                        random = as.formula(paste0("~1|", id_variable_name)),
+                        na.action = na.omit, #again, missing data comes from lags and is omitted
+                        correlation = corCAR1(form = as.formula(paste0("~", variable_name_defining_correlation_structure,"|",
+                                                                       id_variable_name, "/", day_variable_name))),
+                        data = df, method = estimation,
+                        control = control_params)
+    models_simple[[variable]] <- model_simple
+  }
+  return(list(models_complete = models_complete, models_simple = models_simple))
+}
+
+#need to be specified for when calling the function
+variable_name_defining_correlation_structure='beeptime' #this is also a fixed effects and a random effects variable
+estimation='REML'
+factors=FALSE
+
+
+control_params <- lmeControl(maxIter = 100, msMaxIter = 100, tolerance = 1e-6, niterEM = 50, opt = "optim")
+
+REML_models_results <- lme_analysis(data, cols_to_analyze, id_variable_name, day_variable_name, beep_time_variable_name, group_centred_variable_name,
+                               lagged_critical_event_centred_variable_name,control_params, variable_name_defining_correlation_structure,
+                               estimation, factors)
+REML_models_results_complete <- REML_models_results$models_complete
+REML_models_results_simple <- REML_models_results$models_simple
+
+ss_col<-c('SS')
+REML_models_results_SS <- lme_analysis(data, ss_col, id_variable_name, day_variable_name, beep_time_variable_name, group_centred_variable_name,
+                                  critical_event_centred_variable_name, control_params, variable_name_defining_correlation_structure,
+                                  estimation, factors)
+REML_models_results_complete_SS <- REML_models_results_SS$models_complete
+REML_models_results_simple_SS <- REML_models_results_SS$models_simple
+```
+
+### Extracting BICs to compare simple with complex models
+```{r bic_for_models}
+extract_bic <- function(cols_to_analyze, simple_models, complete_models) {
+  bic_results <- list()
+  selected_models <- list()  # Initialize the list inside the function
+  
+  for (variable in cols_to_analyze) {
+    bic_simple <- NA
+    bic_complex <- NA
+    
+
+    if (!is.null(simple_models[[variable]])) {
+      bic_simple <- BIC(simple_models[[variable]])
+    } else {
+      message(paste0("Simple model is NULL for: ", variable))
+    }
+    
+    if (!is.null(complete_models[[variable]])) {
+      bic_complex <- BIC(complete_models[[variable]])
+    } else {
+      message(paste0("Complex model is NULL for: ", variable))
+    }
+    
+    bic_results[[variable]] <- list(simple = bic_simple, complex = bic_complex)
+    
+    if (!is.na(bic_simple) && !is.na(bic_complex)) {
+      if (bic_simple > bic_complex) {
+        selected_models[[variable]] <- 'complete'
+      } else {
+        selected_models[[variable]] <- 'simple'
+      }
+    } else {
+      message(paste0("Model comparison cannot be performed for variable: ", variable))
+      selected_models[[variable]] <- NULL
+    }
+  }
+  
+  return(list(bic_results = bic_results, selected_models = selected_models))
+}
+
+bic_comparison <- extract_bic(cols_to_analyze, REML_models_results_simple, REML_models_results_complete)
+bic_values <- bic_comparison$bic_results
+selected_models <- bic_comparison$selected_models
+
+print(bic_values)
+
+bic_comparison_SS <- extract_bic(ss_col, REML_models_results_simple_SS, REML_models_results_complete_SS)
+bic_value_SS <- bic_comparison_SS$bic_results
+selected_models_SS <- bic_comparison_SS$selected_models
+
+print(bic_value_SS)
+```
+### Computing again models with ML estimation and extracting those that were best in the REML estimation using BIC as criterion
+```{r final_models}
+
+estimation='ML' #using ML estimation becasue we are primarly interested in the fixed effects
+
+ML_models_results <- lme_analysis(data, cols_to_analyze, id_variable_name, day_variable_name, beep_time_variable_name, group_centred_variable_name,
+                               lagged_critical_event_centred_variable_name,control_params, variable_name_defining_correlation_structure,
+                               estimation, factors)
+ML_models_results_complete <- ML_models_results$models_complete
+ML_models_results_simple <- ML_models_results$models_simple
+
+ML_models_results_SS <- lme_analysis(data, ss_col, id_variable_name, day_variable_name, beep_time_variable_name, group_centred_variable_name,
+                                  critical_event_centred_variable_name, control_params, variable_name_defining_correlation_structure,
+                                  estimation, factors)
+ML_models_results_complete_SS <- ML_models_results_SS$models_complete
+ML_models_results_simple_SS <- ML_models_results_SS$models_simple
+
+
+
+
+build_list_final_models<- function(variables_list, selected_models, complete_models, simple_models){
+  final_models<-list()
+  
+  for (variable in variables_list) {
+    if (selected_models[[variable]]=='complete'){
+        final_models[[variable]]<-complete_models[[variable]]
+    } else if (selected_models[[variable]]=='simple') {
+        final_models[[variable]]<-simple_models[[variable]]
+    } else {
+       final_models[[variable]]<-NULL
+    }
+  }
+  return(final_models)
+}
+
+final_models<-build_list_final_models(cols_to_analyze, selected_models, ML_models_results_complete, ML_models_results_simple)
+final_models_SS<-build_list_final_models(ss_col, selected_models_SS, ML_models_results_complete_SS, ML_models_results_simple_SS)
+merged_final_models <- c(final_models, final_models_SS)
+#print(merged_final_models)
+```
+
+### Output results for the final models and generate tables
+```{r tables_models_complete}
+
+save_tTable_apa <- function(t_table, file_path, variable) {
+  t_table_formatted <- as.data.frame(t_table)
+  colnames(t_table_formatted) <- c("Estimate", "Std.Error", "df", "t-value", "p-value")
+  
+  t_table_formatted <- t_table_formatted %>%
+    mutate(across(everything(), ~ round(., 3)))
+  
+  kable(t_table_formatted, format = "html", digits = 3, align = "c", caption = paste0("Fixed Effects Table for " , variable))  %>%
+    kable_styling("striped", full_width = FALSE, position = "center") %>%
+    save_kable(file_path)
+}
+
+save_model_summary <- function(model, file_path) {
+  sink(file_path)
+  cat("<html><body><pre>")
+  print(summary(model))
+  cat("</pre></body></html>")
+  sink()
+}
+
+
+generate_table_models <- function(models, cols_to_analyze, model_type) {
+  tables <- list()
+  for (variable in cols_to_analyze) {
+    print(paste0("Results for: ", variable))
+    print(summary(models[[variable]]))
+    file_path_tTable <- paste0("Fixed_effects_table_", variable, "_model_v",version_number,"_", model_type,".html")
+    file_path_model_summary <- paste0("Model_summary_",variable, "_model_v",version_number,"_", model_type,".html")
+    t_table<-as.data.frame(summary(models[[variable]])$tTable)
+    save_tTable_apa(t_table, file_path_tTable, variable)
+    save_model_summary(models[[variable]], file_path_model_summary)
+    tables[[variable]] <- t_table
+
+    
+  }
+  return(tables)
+}
+
+all_cols_to_analyze<-c(cols_to_analyze, ss_col)
+
+#print('Complete models:')
+#complete_models_text<-'complete'
+#generate_table_models(ML_models_results_complete, cols_to_analyze, complete_models_text)
+#generate_table_models(ML_models_results_complete_SS, ss_col, complete_models_text)
+
+
+#print('Simple models:')
+#simple_models_text<-'simple'
+#generate_table_models(ML_models_results_simple, cols_to_analyze, simple_models_text)
+#generate_table_models(ML_models_results_simple_SS, ss_col, simple_models_text)
+
+print('Final models:')
+final_models_text<-'final'
+generate_table_models(merged_final_models, all_cols_to_analyze, final_models_text)
+```
+
+### Function to extract the estimated marginal means (EMMs) for the interaction effects from a givel list of variables and models
+```{r emms}
+get_interaction_emms_from_models <- function(models_list, variable_names, group_variable_name, other_variable_name) {
+  emms_list <- list()
+  
+  for (variable in variable_names){
+    interaction_formula <- as.formula(paste0("~ ",  other_variable_name, "* ", group_variable_name))
+
+    model <- models_list[[variable]]
+    
+    emms <- emmeans(model, interaction_formula)
+    emms_list[[variable]] <- emms
+  }
+  
+  return(emms_list)
+}
+```
+
+
+### Run models again with non-centred variables and extract EMMs for plotting
+```{r models_for_plotting}
+
+factors=FALSE #this could also be set to TRUE and it should not make a difference given that group and critical event are both binary
+models_results_for_EMMs <- lme_analysis(data, cols_to_analyze, id_variable_name, day_variable_name, beep_time_variable_name, group_variable_name,
+                                        lagged_critical_event_variable_name, control_params, variable_name_defining_correlation_structure,
+                                        estimation, factors)
+models_results_complete_for_EMMs <- models_results_for_EMMs$models_complete
+models_results_simple_for_EMMs <- models_results_for_EMMs$models_simple
+
+models_results_SS_for_EMMs <- lme_analysis(data, ss_col, id_variable_name, day_variable_name, beep_time_variable_name, group_variable_name,
+                                           critical_event_variable_name,
+                                           control_params, variable_name_defining_correlation_structure,
+                                           estimation, factors)
+models_results_complete_SS_for_EMMs <- models_results_SS_for_EMMs$models_complete
+models_results_simple_SS_for_EMMs <- models_results_SS_for_EMMs$models_simple
+
+
+EMMs_final_models<-build_list_final_models(cols_to_analyze, selected_models, models_results_complete_for_EMMs, models_results_simple_for_EMMs)
+EMMs_final_models_SS<-build_list_final_models(ss_col, selected_models_SS, models_results_complete_SS_for_EMMs, models_results_simple_SS_for_EMMs)
+EMMs_merged_final_models <- c(EMMs_final_models, EMMs_final_models_SS)
+#print(EMMs_merged_final_models)
+
+
+emms_interaction_results <- get_interaction_emms_from_models(EMMs_merged_final_models, cols_to_analyze, group_variable_name,
+                                                                      lagged_critical_event_variable_name)
+
+
+emms_interaction_results_SS <- get_interaction_emms_from_models(EMMs_merged_final_models, ss_col, group_variable_name,
+                                                                         critical_event_variable_name)
+
+merged_emms_interaction_results<-c(emms_interaction_results, emms_interaction_results_SS)
+
+```
+
+### Computing effect sizes for the interaction effect
+```{r effect_sizes}
+
+compute_effect_sizes<-function(models_list, emms_effects, devepended_variables, model_type){
+  for (variable in devepended_variables){
+    
+    print(paste0('Computting effect sizes for variable: ', variable))
+    emms<-emms_effects[[variable]]
+    model<-models_list[[variable]]
+    contrasts <- contrast(emms, method = 'pairwise')
+    
+    residual_variance <- summary(model)$sigma^2
+    random_effects_variance <- sum(diag(getVarCov(model)))
+    print(getVarCov(model))
+    total_variance <- random_effects_variance + residual_variance
+    
+    effect_sizes <- contrasts %>%
+      as.data.frame() %>%
+      mutate(cohen_d = estimate / sqrt(total_variance))
+    
+    print(effect_sizes)
+    
+    file_path_effect_sizes <- paste0("Effect_sizes_",variable, "_model_v",version_number,"_",model_type,".html")
+    
+    kable(effect_sizes, format = "html", digits = 3, align = "c", caption = paste0("Effects sizes for " , variable))  %>%
+      kable_styling("striped", full_width = FALSE, position = "center") %>%
+      save_kable(file_path_effect_sizes)
+  
+  }
+}
+
+compute_effect_sizes(EMMs_merged_final_models, merged_emms_interaction_results, all_cols_to_analyze, final_models_text)
+```
+### Perform post hoc on EMMs
+```{r constrasts_emms}
+perform_constrast_comparisons_for_interaction <- function(list_emms_objects_containing_interactions, cols_to_analyze) {
+  constrast_results <- list()
+  for (variable in cols_to_analyze) {
+    print(paste0("Performing post hoc comparisons for: ", variable))
+    
+    interaction_formula <- as.formula(paste0("~ ", critical_event_variable_name, "* ", group_variable_name))
+    
+    emm_object <- list_emms_objects_containing_interactions[[variable]]
+    adjusted_contrasts <- contrast(emm_object, method = "pairwise", adjust = "tukey")
+    print(emm_object)
+    print(adjusted_contrasts)
+    constrast_results[[variable]] <- adjusted_contrasts
+  }
+  return(constrast_results)
+}
+
+all_contrasts<-perform_constrast_comparisons_for_interaction (merged_emms_interaction_results, all_cols_to_analyze)
+```
+
+
+### Plot the EMMs
+```{r emms_plots}
+plot_emms <- function(emms_df, x_var_name, group_var_name, plot_title, other_event_label) {
+  emms_df[[group_var_name]] <- as.factor(emms_df[[group_var_name]])
+  emms_df[[x_var_name]] <- as.factor(emms_df[[x_var_name]])
+  
+  p <- ggplot(emms_df, aes(x = !!sym(x_var_name), y = emmean, color = !!sym(group_var_name), shape = !!sym(group_var_name))) +
+    geom_point(size = 4, position = position_dodge(width = 0.2)) +
+    geom_errorbar(
+      aes(ymin = lower.CL, ymax = upper.CL),
+      width = 0.2, position = position_dodge(width = 0.2)
+    ) +
+    geom_line(aes(group = !!sym(group_var_name)), position = position_dodge(width = 0.2)) +
+    labs(x = other_event_label, y = "Estimated Marginal Means", title = plot_title, color = "Group", shape = "Group") +
+    scale_color_manual(values = c("gray80", "black"), labels = levels(emms_df[[group_var_name]])) +
+    scale_shape_manual(values = c(16, 17), labels = levels(emms_df[[group_var_name]])) +  # Circle and triangle
+    scale_x_discrete(labels = levels(as.factor(emms_df[[x_var_name]]))) +
+    theme_classic() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(
+        hjust = 0.5,
+        color = "black"
+      )
+    )
+  
+  return(p)
+}
+
+
+save_emms_plots <- function(emms_results_list, group_variable_name, other_variable_name, dependent_variables_names, other_event_label) {
+  
+  for (model_index in seq_along(emms_results_list)) {
+    emms_object <- emms_results_list[[model_index]]
+    dep_var_name <- names(emms_results_list)[model_index]
+    dep_var_for_title <- dependent_variables_names[model_index]
+    
+    emms_df <- as.data.frame(emms_object)
+    
+    if (!is.null(emms_df)) {
+      x_var_name <- other_variable_name
+      group_var_name <- group_variable_name
+      
+      plot_title <- paste("Estimated Marginal Means for", dep_var_for_title)
+      plot <- plot_emms(emms_df, x_var_name, group_var_name, plot_title, other_event_label)
+      file_name <- file.path(paste0(dep_var_name, "_plot",".png"))
+      ggsave(file_name, plot)
+      print(plot)
+    }
+  }
+}
+
+
+SS_col_for_plots<-c('Self Efficacy')
+
+save_emms_plots(emms_interaction_results, group_variable_name, lagged_critical_event_variable_name, cols_for_plots, 'Lagged critical event')
+save_emms_plots(emms_interaction_results_SS, group_variable_name, critical_event_variable_name, SS_col_for_plots, 'Critical event')
+```
+
+## Secondary analysis on the critical events
+### Computing the model for critical event treated as a binomial variable
+```{r critical_events_analysis}
+
+binomial_analysis <- function(dataset, cols_to_analyze, id_variable_name, day_variable_name, beep_time_variable_name, group_variable_name, 
+                              control_params, estimation, factors = FALSE) {
+  
+  df <- dataset
+  
+  if (factors) {
+    df[[group_variable_name]] <- as.factor(df[[group_variable_name]])
+    df[[day_variable_name]] <- as.factor(df[[day_variable_name]])
+  }
+
+  models_results <- list()
+
+  for (variable in cols_to_analyze) {
+    
+    formula_binomial <- as.formula(
+      paste0(variable, " ~ ", day_variable_name, " + ", beep_time_variable_name, " + ", group_variable_name, 
+             " + ", day_variable_name, " * ", group_variable_name,
+             " + (1 | ", id_variable_name, ")")
+    )
+    
+    model_output <- glmer(formula_binomial,
+                            family = binomial(link = estimation),
+                            data = df,
+                            control = control_params,
+                            na.action = na.omit)
+    models_results[[variable]] <- model_output
+  }
+  
+  return(models_results)
+}
+
+
+estimation_binomial <- "logit"
+control_params_binomial <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 10000000), calc.derivs = TRUE)
+cols_for_binomial <- c("critical_event")
+factors_binomial <-FALSE
+
+
+binomial_models_results <- binomial_analysis(data, cols_for_binomial, id_variable_name, day_variable_name,
+                                             beep_time_variable_name, group_variable_name,
+                                             control_params_binomial, estimation_binomial, factors_binomial)
+```
+
+```{r ci_for_odds_ratios}
+compute_ci_odds_ratios <- function(models, dependent_variables_list) {
+  confidence_intervals_list<-list()
+  
+  for (variable in dependent_variables_list){
+    model<-models[[variable]]
+    fixed_effects <- fixef(model)
+    ci_log_odds <- confint(model, method='Wald')
+    effects_names <- names(fixed_effects)
+    ci_log_odds <- ci_log_odds[effects_names, , drop = FALSE]
+    
+    odds_ratios <- exp(fixed_effects)
+    ci_odds_ratios <- exp(ci_log_odds)
+    
+    confidence_intervals<-data.frame(
+      Effect = names(fixed_effects),
+      Odds_Ratio = odds_ratios,
+      Lower_CI = ci_odds_ratios[, 1],
+      Upper_CI = ci_odds_ratios[, 2],
+      row.names = NULL
+    )
+    confidence_intervals_list[[variable]]<-confidence_intervals
+  }
+  return(confidence_intervals_list)
+}
+
+odds_ratios_results <- compute_ci_odds_ratios(binomial_models_results, cols_for_binomial)
+```
+
+``` {r binomial_model_tables}
+#Results are accessible directly trough the summary
+print(summary(binomial_models_results[["critical_event"]]))
+
+print(odds_ratios_results)
+```
+
+```{r binomial_plot}
+
+avg_by_day_id <- data %>%
+  group_by(across(all_of(c(id_variable_name, day_variable_name)))) %>%
+  summarise(
+    daily_avg = mean(!!sym(critical_event_variable_name), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+freq_df <- avg_by_day_id %>%
+  left_join(data %>% select(all_of(c(id_variable_name, group_variable_name))) %>% distinct(), by = id_variable_name) %>%
+  group_by(across(all_of(c(day_variable_name, group_variable_name)))) %>%
+  summarise(
+    group_daily_avg = mean(daily_avg, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+
+plot_frequencies <- function(dataset, other_time_variable, group_variable_name, time_label) {
+  df<-dataset
+  df[[group_variable_name]] <- as.factor(df[[group_variable_name]])
+  df[[other_time_variable]] <- df[[other_time_variable]] + 1
+  
+  ggplot(df, aes(
+    x = .data[[other_time_variable]], 
+    y = group_daily_avg, 
+    color = .data[[group_variable_name]], 
+    shape = .data[[group_variable_name]],
+    group = .data[[group_variable_name]]
+  )) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    scale_color_manual(values = c("gray80", "black")) +
+    scale_shape_manual(values = c(16, 17)) +
+    labs(
+      x = time_label,
+      y = "Average Frequency of Critical Events",
+      title = "Frequency of Critical Event Across Groups",
+      color = "Group",
+      shape = "Group"
+    ) +
+    theme_classic() +
+    scale_x_continuous(breaks = unique(df[[other_time_variable]])) + 
+    theme(
+      legend.position = "right",
+      plot.title = element_text(
+        hjust = 0.5,
+        color = "black"
+      )
+    )
+}
+
+
+frequnecy_plot <- plot_frequencies(freq_df, "day", "group", "Days")
+print(frequnecy_plot)
+file_name_frequnecy_plot <- file.path('Critical_event_frequency_plot.png')
+ggsave(file_name_frequnecy_plot, frequnecy_plot)
+
+
+```
+
+## Save data to a new file at the end
+```{r save_data}
+write.csv(data, file='Processed_data.csv', row.names=F)
+```
+
