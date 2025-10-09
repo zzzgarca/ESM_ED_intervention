@@ -17,7 +17,7 @@ This repository contains the analysis scripts in **R Markdown** for the paper:
 ## Usage  
 1. Open the R Markdown notebook (`.Rmd`) to reproduce the entire data processing and analysis pipeline.  
 2. The notebook contains code for data cleaning, descriptive statistics, and the multi-level mixed-effects models.  
-3. Data are not publicly shared due to participant confidentiality; scripts are provided for transparency and reproducibility.  
+3. Data and scripts are provided for transparency and reproducibility. They are also available for download as supplementary material of the original paper.
 
 ---
 
